@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <title>Mapa Mundial con Proyección Miller y Geodésicas</title>
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <script src= "https://d3js.org/d3-geo-projection.v2.min.js"></script> 
+  <style>
+    body { margin: 0; overflow: hidden; }
+    svg { background: #e0f7fa; }
+    .country { fill: #ccc; stroke: #666; stroke-width: 0.5px; }
+    .geodesic { fill: none; stroke: red; stroke-width: 1.3px; }
+  </style>
+</head>
+<body>
+  <svg width="1000" height="600"></svg>
+  <script>
+    const width = 1000, height = 600;
+    const svg = d3.select("svg")
+                  .attr("width", width)
+                  .attr("height", height);
+
+    // Usamos la proyección Miller (d3.geoMiller)
+    const projection = d3.geoMiller()
+                         .scale(150) // escala inicial
+                         .translate([width / 2, height / 2]);
+    const path = d3.geoPath().projection(projection);
+
+    // Grupos para los elementos del mapa y las geodésicas
+    const mapGroup = svg.append("g");
+    const countriesGroup = mapGroup.append("g");
+    const linesGroup = mapGroup.append("g").attr("class", "geodesics");
+
+    // Cargar y dibujar el mapa mundial (GeoJSON)
+    d3.json("https://raw.githubusercontent.com/johan/world.geo.json/master/countries.geo.json")
+      .then(function(world) {
+        const features = world.features//.filter(f => f.properties.name !== "Antarctica");
+        // Ajustar la proyección a los datos del mundo
+        projection.fitSize([width, height], {type: "FeatureCollection", features: features});
+        // Dibujar los países
+        countriesGroup.selectAll("path.country")
+          .data(features)
+          .enter().append("path")
+            .attr("class", "country")
+            .attr("d", path);
+      });
+
+    // Funciones para cálculos esféricos (geometría)
+    function toRadians(deg) { return deg * Math.PI / 180; }
+    function toDegrees(rad) { return rad * 180 / Math.PI; }
+    function latLonToVector(lon, lat) {
+      const φ = toRadians(lat), λ = toRadians(lon);
+      const x = Math.cos(φ) * Math.cos(λ);
+      const y = Math.cos(φ) * Math.sin(λ);
+      const z = Math.sin(φ);
+      return [x, y, z];
+    }
+    function normalize([x, y, z]) {
+      const mag = Math.sqrt(x*x + y*y + z*z);
+      return mag === 0 ? [0, 0, 0] : [x / mag, y / mag, z / mag];
+    }
+    function cross([x1, y1, z1], [x2, y2, z2]) {
+      return [
+        y1 * z2 - z1 * y2,
+        z1 * x2 - x1 * z2,
+        x1 * y2 - y1 * x2
+      ];
+    }
+    function vectorToLatLon([x, y, z]) {
+      const mag = Math.sqrt(x*x + y*y + z*z);
+      const vx = x / mag, vy = y / mag, vz = z / mag;
+      const lat = toDegrees(Math.asin(vz));
+      const lon = toDegrees(Math.atan2(vy, vx));
+      return [lon, lat];
+    }
+
+    // Función para calcular 24 líneas geodésicas (círculos máximos) que conectan un punto con su antipodal
+    function computeGeodesicLines(lon, lat, count = 24) {
+      const a = normalize(latLonToVector(lon, lat));  // vector unitario del punto clickeado
+      // Seleccionar un vector base arbitrario perpendicular a 'a'
+      let base = [0, 0, 1];
+      if (Math.abs(a[0]) < 1e-6 && Math.abs(a[1]) < 1e-6) {
+        base = [1, 0, 0];
+      }
+      let b0 = normalize(cross(a, base));
+      if (Math.hypot(...b0) < 1e-6) {
+        base = [1, 0, 0];
+        b0 = normalize(cross(a, base));
+      }
+      const c = normalize(cross(a, b0));  // segundo vector perpendicular
+      const lines = [];
+      for (let k = 0; k < count; k++) {
+        const theta = (2 * Math.PI * k) / count;
+        const cosθ = Math.cos(theta), sinθ = Math.sin(theta);
+        // Rotar b0 alrededor del eje 'a' para obtener la dirección k-ésima
+        const b_k = [
+          b0[0] * cosθ + c[0] * sinθ,
+          b0[1] * cosθ + c[1] * sinθ,
+          b0[2] * cosθ + c[2] * sinθ
+        ];
+        // Generar puntos a lo largo del círculo máximo desde 'a' hasta '-a'
+        const coords = [];
+        const numSeg = 180;  // mayor número de segmentos para una línea más suave
+        for (let j = 0; j <= numSeg; j++) {
+          const φ = Math.PI * j / numSeg;
+          const cosφ = Math.cos(φ), sinφ = Math.sin(φ);
+          const x = a[0] * cosφ + b_k[0] * sinφ;
+          const y = a[1] * cosφ + b_k[1] * sinφ;
+          const z = a[2] * cosφ + b_k[2] * sinφ;
+          coords.push(vectorToLatLon([x, y, z]));
+        }
+        lines.push({ type: "LineString", coordinates: coords });
+      }
+      return lines;
+    }
+
+    // Configuración para zoom y pan
+    let currentTransform = d3.zoomIdentity;
+    const zoom = d3.zoom()
+      .scaleExtent([1, 8])
+      .on("zoom", event => {
+        currentTransform = event.transform;
+        mapGroup.attr("transform", currentTransform);
+      });
+    svg.call(zoom);
+
+    // Evento de click para generar las líneas geodésicas
+    svg.on("click", function(event) {
+      if (event.defaultPrevented) return; // ignora si fue parte de un gesto de zoom/drag
+      const [sx, sy] = d3.pointer(event, this);
+      const [px, py] = currentTransform.invert([sx, sy]);
+      const clickedLonLat = projection.invert([px, py]);
+      if (!clickedLonLat) return;
+      const [lon, lat] = clickedLonLat;
+      // Calcular las líneas geodésicas
+      const geodesics = computeGeodesicLines(lon, lat, 24);
+      // Asociar los datos con los elementos <path>
+      const geodesicPaths = linesGroup.selectAll("path.geodesic")
+        .data(geodesics);
+      geodesicPaths.exit().remove();
+      geodesicPaths.enter().append("path")
+        .attr("class", "geodesic")
+        .each(function(d) { this._current = d; })
+        .attr("d", path);
+      // Transición suave para actualizar las líneas
+      linesGroup.selectAll("path.geodesic")
+        .transition().duration(1000)
+        .attrTween("d", function(d) {
+          const previous = this._current;
+          const current = d;
+          const interp = d3.interpolateArray(previous.coordinates, current.coordinates);
+          this._current = current;
+          return t => path({ type: "LineString", coordinates: interp(t) });
+        });
+    });
+  </script>
+</body>
+</html>
